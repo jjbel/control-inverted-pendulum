@@ -1,310 +1,440 @@
-/*
- * AMT22_SPI_Sample_Code.ino
- * Company: CUI Inc.
- * Author: Jason Kelly
- * Version: 2.0.1.0
- * Date: August 20, 2019
- * 
- * This sample code can be used with the Arduino Uno to control the AMT22 encoder.
- * It uses SPI to control the encoder and the the Arduino UART to report back to the PC
- * via the Arduino Serial Monitor.
- * For more information or assistance contact CUI Inc for support.
- * 
- * After uploading code to Arduino Uno open the open the Serial Monitor under the Tools 
- * menu and set the baud rate to 115200 to view the serial stream the position from the AMT22.
- * 
- * Arduino Pin Connections
- * SPI Chip Select Enc 0:   Pin  2
- * SPI Chip Select Enc 1:   Pin  3
- * SPI MOSI                 Pin 11
- * SPI MISO                 Pin 12
- * SPI SCLK:                Pin 13
- * 
- * 
- * AMT22 Pin Connections
- * Vdd (5V):                Pin  1
- * SPI SCLK:                Pin  2
- * SPI MOSI:                Pin  3
- * GND:                     Pin  4
- * SPI MISO:                Pin  5
- * SPI Chip Select:         Pin  6
- * 
- * 
- * This is free and unencumbered software released into the public domain.
- * Anyone is free to copy, modify, publish, use, compile, sell, or
- * distribute this software, either in source code form or as a compiled
- * binary, for any purpose, commercial or non-commercial, and by any
- * means.
- * 
- * In jurisdictions that recognize copyright laws, the author or authors
- * of this software dedicate any and all copyright interest in the
- * software to the public domain. We make this dedication for the benefit
- * of the public at large and to the detriment of our heirs and
- * successors. We intend this dedication to be an overt act of
- * relinquishment in perpetuity of all present and future rights to this
- * software under copyright law.
- * 
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
- * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
- * OTHER DEALINGS IN THE SOFTWARE.
- */
+// EE324 Controls Lab - Experiment 3 - Inverted Pendulum LQR
+//
+// Pin mapping follows the Experiment 2 gimbal code exactly:
+//   SPI: MOSI 51, MISO 50, SCLK 52  (500 kHz, DIV32)
+//   Encoder CS pins: 45 and 48
+//   Motor channel B: EN 7, IN3 5, IN4 6
+//
+//   ARM  (theta) encoder -> CS 48  (on the motor shaft)
+//   PEND (alpha) encoder -> CS 45  (at the pendulum pivot)
+// If theta/alpha come out swapped in the serial prints,
+// exchange the two CS numbers below.
+//
+//  1) Pick Q and R, then:
+//       python monitor.py --q q1 q2 q3 q4 --upload
+//     computes K, writes it into K1..K4 below and flashes.
+//     Without --upload the same K is sent over serial
+//     instead (lost on reset). lqr_pendulum.py has the model.
+//  2) Power up / reset with the pendulum HANGING DOWN at
+//     rest (don't touch it) and the arm centred -
+//     both encoders are zeroed in software during setup()
+//     (no hardcoded zero counts needed, unlike Exp 2).
+//  3) After zeroing, lift the pendulum up slowly. Within
+//     CATCH_ANGLE_DEG of vertical the controller engages.
+//  4) Motor cuts off if |alpha| > 30 deg or |theta| > 120 deg
+//     (safety). Bring the pendulum upright to re-engage.
+//
+// SERIAL COMMANDS (115200, newline-terminated):
+//   k <K1> <K2> <K3> <K4>   replace the LQR gains until reset
+//
+// SIGN CHECK (do this once, gently):
+//  - Watch serial: tilt pendulum in the direction that makes
+//    alpha POSITIVE. On engagement the arm must move so the
+//    pivot chases under the fall. If instead it runs away and
+//    the pendulum drops immediately, flip MOTOR_SIGN.
+//  - If it "fights itself" (oscillates and throws the
+//    pendulum off), flip ALPHA_SIGN.
 
-
-/* Include the SPI library for the arduino boards */
+#include <LibPrintf.h>
 #include <SPI.h>
 
-/* Serial rates for UART */
-#define BAUDRATE        115200
+#define SPI_MOSI 51
+#define SPI_MISO 50
+#define SPI_SCLK 52
 
-/* SPI commands */
-#define AMT22_NOP       0x00
-#define AMT22_RESET     0x60
-#define AMT22_ZERO      0x70
+// ENCODER CHIP SELECTS
+#define ARM_CS 45  // theta - base/arm encoder (motor shaft)
+#define PEND_CS 48 // alpha - pendulum encoder
 
-/* Define special ascii characters */
-#define NEWLINE         0x0A
-#define TAB             0x09
+// ARM MOTOR - L298N channel B (channel A is EN 2, IN1 3, IN2 4)
+#define MOTOR_EN 7  // ENB
+#define MOTOR_IN1 5 // IN3
+#define MOTOR_IN2 6 // IN4
 
-/* We will use these define macros so we can write code once compatible with 12 or 14 bit encoders */
-#define RES12           12
-#define RES14           14
+// Flip these (+1 / -1) per the SIGN CHECK above instead of
+// rewiring anything.
+#define MOTOR_SIGN -1
+#define ALPHA_SIGN 1
+#define THETA_SIGN 1
 
-/* SPI pins */
-#define ENC_0            48
-#define ENC_1            48
-#define SPI_MOSI        51
-#define SPI_MISO        50
-#define SPI_SCLK        52
+// LQR GAINS  (units: V/rad and V/(rad/s))
+//
+// u = -(K1*theta + K2*alpha + K3*theta_dot + K4*alpha_dot)
+// The defaults below; `k` on serial overrides them at runtime.
+// monitor.py --upload rewrites the Q line and the four
+// defines together, so keep them adjacent.
 
-void setup() 
-{
-  //Set the modes for the SPI IO
+// Q = diag([8 200 0.5 0]), R = 1
+#define K1 -2.8284 // theta
+#define K2 47.7090 // alpha
+#define K3 -1.6305 // theta_dot
+#define K4 5.8459 // alpha_dot
+
+// CONTROL SETTINGS
+
+#define LOOP_DT_US 5000UL     // 5 ms -> 200 Hz
+#define VMAX 12.0             // motor voltage limit (V)
+#define CATCH_ANGLE_DEG 3.0   // engage when |alpha| below
+#define ALPHA_LIMIT_DEG 30.0  // disengage above this
+#define THETA_LIMIT_DEG 120.0 // arm safety limit
+#define VEL_FILTER_ALPHA 0.35 // velocity LPF, 0..1
+
+// L298N + motor deadband: smallest voltage that actually
+// makes the motor move. Commands are boosted past this so
+// small LQR corrections aren't swallowed by friction and
+// the driver's internal drop. Find yours: raise PWM slowly
+// with a test sketch until the motor just turns, convert to
+// volts (pwm/255*12). Typical: 1.5 - 3.0 V.
+#define MOTOR_DEADBAND_V 2.0
+
+// AMT22 14-bit: 16384 counts/rev, direct drive on this rig
+#define RAD_PER_COUNT (2.0 * PI / 16384.0)
+
+// AMT22
+
+#define AMT22_NOP 0x00
+#define RES14 14
+#define RES12 12
+
+// STATE
+
+uint16_t armZeroCount = 0;
+uint16_t pendZeroCount = 0;
+
+float theta = 0.0, alpha = 0.0;       // rad
+float thetaDot = 0.0, alphaDot = 0.0; // rad/s (filtered)
+float thetaPrev = 0.0, alphaPrev = 0.0;
+
+bool controlActive = false;
+
+float K[4] = {K1, K2, K3, K4};
+
+unsigned long lastLoopMicros = 0;
+int print_variable = 0;
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+
   pinMode(SPI_SCLK, OUTPUT);
   pinMode(SPI_MOSI, OUTPUT);
   pinMode(SPI_MISO, INPUT);
-  pinMode(ENC_0, OUTPUT);
-  pinMode(ENC_1, OUTPUT);
-  
-  //Initialize the UART serial connection for debugging
-  Serial.begin(BAUDRATE);
 
-  //Get the CS line high which is the default inactive state
-  digitalWrite(ENC_0, HIGH);
-  digitalWrite(ENC_1, HIGH);
+  pinMode(ARM_CS, OUTPUT);
+  pinMode(PEND_CS, OUTPUT);
+  digitalWrite(ARM_CS, HIGH);
+  digitalWrite(PEND_CS, HIGH);
 
-  //set the clockrate. Uno clock rate is 16Mhz, divider of 32 gives 500 kHz.
-  //500 kHz is a good speed for our test environment
-  //SPI.setClockDivider(SPI_CLOCK_DIV2);   // 8 MHz
-  //SPI.setClockDivider(SPI_CLOCK_DIV4);   // 4 MHz
-  //SPI.setClockDivider(SPI_CLOCK_DIV8);   // 2 MHz
-  //SPI.setClockDivider(SPI_CLOCK_DIV16);  // 1 MHz
-  SPI.setClockDivider(SPI_CLOCK_DIV32);    // 500 kHz
-  //SPI.setClockDivider(SPI_CLOCK_DIV64);  // 250 kHz
-  //SPI.setClockDivider(SPI_CLOCK_DIV128); // 125 kHz
-  
-  //start SPI bus
   SPI.begin();
+
+  // 16 MHz / 32 = 500 kHz
+  SPI.setClockDivider(SPI_CLOCK_DIV32);
+
+  pinMode(MOTOR_EN, OUTPUT);
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  stopMotor();
+
+  printf("\n====================================\n"
+         "*** VEDIKA'S CODE ***\n"
+         "INVERTED PENDULUM - LQR BALANCE\n\n");
+  printGains();
+  printf("\nLet pendulum HANG DOWN at rest, arm\n"
+         "centred. Zeroing encoders in 3 s...\n"
+         "====================================\n");
+
+  delay(3000);
+
+  armZeroCount = averagePosition(ARM_CS);
+  pendZeroCount = averagePosition(PEND_CS);
+
+  printf("Arm zero count: %u\n"
+         "Pendulum zero count (hanging): %u\n\n"
+         "Now lift pendulum slowly to the top.\n"
+         "ALPHA should read 0 at the top -\n"
+         "controller engages within +/-%.0f deg.\n"
+         "====================================\n",
+         armZeroCount, pendZeroCount, CATCH_ANGLE_DEG);
+
+  lastLoopMicros = micros();
 }
 
-void loop() 
-{
-  //create a 16 bit variable to hold the encoders position
-  uint16_t encoderPosition;
-  //let's also create a variable where we can count how many times we've tried to obtain the position in case there are errors
-  uint8_t attempts;
+// MAIN LOOP - fixed 200 Hz
+void loop() {
+  // Fixed-rate tick: keeps dt constant so the velocity
+  // estimates and LQR behave consistently
+  while ((micros() - lastLoopMicros) < LOOP_DT_US) {
+  }
+  lastLoopMicros += LOOP_DT_US;
 
+  const float dt = LOOP_DT_US / 1e6;
 
-  //if you want to set the zero position before beggining uncomment the following function call
-  //setZeroSPI(ENC_0);
-  //setZeroSPI(ENC_1);
+  pollSerial();
 
-  //once we enter this loop we will run forever
-  while(1)
-  {
-    //set attemps counter at 0 so we can try again if we get bad position    
-    attempts = 0;
+  // READ BOTH ENCODERS
+  uint16_t armEncoder = getPositionWithRetry(ARM_CS, RES14);
+  uint16_t pendEncoder = getPositionWithRetry(PEND_CS, RES14);
 
-    //this function gets the encoder position and returns it as a uint16_t
-    //send the function either res12 or res14 for your encoders resolution
-    encoderPosition = getPositionSPI(ENC_0, RES14); 
+  if (armEncoder == 0xFFFF || pendEncoder == 0xFFFF) {
+    // Bad SPI read: skip this tick (state held; safety
+    // limits still protect us on the next good read)
+    return;
+  }
 
-    //if the position returned was 0xFFFF we know that there was an error calculating the checksum
-    //make 3 attempts for position. we will pre-increment attempts because we'll use the number later and want an accurate count
-    while (encoderPosition == 0xFFFF && ++attempts < 3)
-    {
-      encoderPosition = getPositionSPI(ENC_0, RES14); //try again
+  // COUNTS -> ANGLES (rad)
+  // theta: arm angle from its zero, wrapped to +/-pi
+  theta = THETA_SIGN * countsToRad(armEncoder, armZeroCount);
+
+  // alpha: pendulum angle measured from UPRIGHT (top = 0).
+  // Encoder is zeroed while hanging down at rest, so shift
+  // by 180 deg: top reads 0, bottom reads +/-180.
+  alpha = ALPHA_SIGN * wrapPi(countsToRad(pendEncoder, pendZeroCount) - PI);
+
+  // VELOCITIES (finite difference + low-pass filter)
+  float thetaDotRaw = wrapPi(theta - thetaPrev) / dt;
+  float alphaDotRaw = wrapPi(alpha - alphaPrev) / dt;
+  thetaPrev = theta;
+  alphaPrev = alpha;
+
+  thetaDot += VEL_FILTER_ALPHA * (thetaDotRaw - thetaDot);
+  alphaDot += VEL_FILTER_ALPHA * (alphaDotRaw - alphaDot);
+
+  // ENGAGE / DISENGAGE
+  float alphaDeg = alpha * 180.0 / PI;
+  float thetaDeg = theta * 180.0 / PI;
+
+  if (!controlActive) {
+    if (abs(alphaDeg) < CATCH_ANGLE_DEG) {
+      controlActive = true;
+
+      // Problem statement: theta is re-defined to 0 deg the
+      // moment the balance controller is activated
+      armZeroCount = armEncoder;
+      theta = 0.0;
+      thetaPrev = 0.0;
+      thetaDot = 0.0;
+
+      // Also clear the pendulum velocity filter: it holds
+      // hand-motion from the lift, which would otherwise
+      // produce a large spurious kick at engagement
+      alphaPrev = alpha;
+      alphaDot = 0.0;
+
+      printf(">>> BALANCE CONTROL ENGAGED <<<\n");
     }
-
-    if (encoderPosition == 0xFFFF) //position is bad, let the user know how many times we tried
-    {
-      Serial.print("Encoder 0 error. Attempts: ");
-      Serial.print(attempts, DEC); //print out the number in decimal format. attempts - 1 is used since we post incremented the loop
-      Serial.write(NEWLINE);
+  } else {
+    if (abs(alphaDeg) > ALPHA_LIMIT_DEG || abs(thetaDeg) > THETA_LIMIT_DEG) {
+      controlActive = false;
+      stopMotor();
+      printf(">>> DISENGAGED (limit hit) <<<\n");
     }
-    else //position was good, print to serial stream
-    {
-      
-      Serial.print("Encoder 0: ");
-      Serial.print(encoderPosition, DEC); //print the position in decimal format
-      Serial.write(NEWLINE);
-    }
+  }
 
-    //////////again for second encoder//////////////////////////////
-    
-    //set attemps counter at 0 so we can try again if we get bad position    
-    attempts = 0;
+  // LQR CONTROL LAW:  u = -K x   (u in Volts)
+  if (controlActive) {
+    float u = -(K[0] * theta + K[1] * alpha + K[2] * thetaDot + K[3] * alphaDot);
 
-    //this function gets the encoder position and returns it as a uint16_t
-    //send the function either res12 or res14 for your encoders resolution
-    encoderPosition = getPositionSPI(ENC_1, RES14); 
+    if (u > VMAX)
+      u = VMAX;
+    if (u < -VMAX)
+      u = -VMAX;
 
-    //if the position returned was 0xFFFF we know that there was an error calculating the checksum
-    //make 3 attempts for position. we will pre-increment attempts because we'll use the number later and want an accurate count
-    while (encoderPosition == 0xFFFF && ++attempts < 3)
-    {
-      encoderPosition = getPositionSPI(ENC_1, RES14); //try again
-    }
+    setMotorVoltage(MOTOR_SIGN * u);
+  } else {
+    stopMotor();
+  }
 
-    if (encoderPosition == 0xFFFF) //position is bad, let the user know how many times we tried
-    {
-      Serial.print("Encoder 1 error. Attempts: ");
-      Serial.print(attempts, DEC); //print out the number in decimal format. attempts - 1 is used since we post incremented the loop
-      Serial.write(NEWLINE);
-    }
-    else //position was good, print to serial stream
-    {
-      
-      Serial.print("Encoder 1: ");
-      Serial.print(encoderPosition, DEC); //print the position in decimal format
-      Serial.write(NEWLINE);
-    }
-
-    //For the purpose of this demo we don't need the position returned that quickly so let's wait a half second between reads
-    //delay() is in milliseconds
-    delay(500);
+  // TELEMETRY every ~100 ms
+  print_variable += 1;
+  if (print_variable >= 20) {
+    print_variable = 0;
+    // kept under the 64-byte TX buffer so it never stalls the loop
+    printf("THETA %7.2f  ALPHA %7.2f  %s\n", thetaDeg, alphaDeg,
+           controlActive ? "ACTIVE" : "idle");
   }
 }
 
-/*
- * This function gets the absolute position from the AMT22 encoder using the SPI bus. The AMT22 position includes 2 checkbits to use
- * for position verification. Both 12-bit and 14-bit encoders transfer position via two bytes, giving 16-bits regardless of resolution.
- * For 12-bit encoders the position is left-shifted two bits, leaving the right two bits as zeros. This gives the impression that the encoder
- * is actually sending 14-bits, when it is actually sending 12-bit values, where every number is multiplied by 4. 
- * This function takes the pin number of the desired device as an input
- * This funciton expects res12 or res14 to properly format position responses.
- * Error values are returned as 0xFFFF
- */
-uint16_t getPositionSPI(uint8_t encoder, uint8_t resolution)
-{
-  uint16_t currentPosition;       //16-bit response from encoder
-  bool binaryArray[16];           //after receiving the position we will populate this array and use it for calculating the checksum
+// GAINS OVER SERIAL
+void printGains() {
+  printf("K = [%.4f, %.4f, %.4f, %.4f]\n", K[0], K[1], K[2], K[3]);
+}
 
-  //get first byte which is the high byte, shift it 8 bits. don't release line for the first byte
-  currentPosition = spiWriteRead(AMT22_NOP, encoder, false) << 8;   
+// k <K1> <K2> <K3> <K4>
+void handleCommand(char *cmd) {
+  char *verb = strtok(cmd, " ");
+  if (verb == NULL || verb[0] != 'k') {
+    printf("unknown command; send: k K1 K2 K3 K4\n");
+    return;
+  }
 
-  //this is the time required between bytes as specified in the datasheet.
-  //We will implement that time delay here, however the arduino is not the fastest device so the delay
-  //is likely inherantly there already
+  char *args[4];
+  for (uint8_t i = 0; i < 4; i++) {
+    args[i] = strtok(NULL, " ");
+    if (args[i] == NULL) {
+      printf("need four gains: k K1 K2 K3 K4\n");
+      return;
+    }
+  }
+
+  // atof, not sscanf %f: avr-libc leaves float parsing out of scanf
+  for (uint8_t i = 0; i < 4; i++)
+    K[i] = atof(args[i]);
+  printGains();
+}
+
+// Gather serial bytes into a line, running each command as it completes
+void pollSerial() {
+  static char buf[64];
+  static uint8_t len;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    // ignore CR so both line endings behave the same
+    if (c == '\r')
+      continue;
+
+    if (c != '\n') {
+      if (len < sizeof(buf) - 1)
+        buf[len++] = c;
+      continue;
+    }
+
+    if (len > 0) {
+      buf[len] = '\0';
+      handleCommand(buf);
+      len = 0;
+    }
+  }
+}
+
+// ANGLE HELPERS
+// Wrap any angle (rad) to (-pi, pi]
+float wrapPi(float a) {
+  while (a > PI)
+    a -= 2.0 * PI;
+  while (a < -PI)
+    a += 2.0 * PI;
+  return a;
+}
+
+// (count - zero) with proper 14-bit wraparound -> radians,
+// signed, in (-pi, pi]
+float countsToRad(uint16_t count, uint16_t zero) {
+  int16_t rel = (int16_t)((count - zero) & 0x3FFF);
+  if (rel > 8191)
+    rel -= 16384;
+  return rel * RAD_PER_COUNT;
+}
+
+// MOTOR CONTROL (L298N, Exp 2 style)
+// Motor voltage (-VMAX..VMAX) -> direction pins + PWM,
+// with deadband compensation: |v| is remapped from
+// 0..VMAX onto DEADBAND..VMAX so even tiny corrections
+// actually move the motor.
+void setMotorVoltage(float v) {
+  float mag = abs(v);
+
+  if (mag < 0.05) // genuinely zero command -> coast
+  {
+    stopMotor();
+    return;
+  }
+  float vEff = MOTOR_DEADBAND_V + mag * (VMAX - MOTOR_DEADBAND_V) / VMAX;
+
+  int pwm = constrain((int)(vEff / VMAX * 255.0), 0, 255);
+
+  if (v > 0) {
+    digitalWrite(MOTOR_IN1, HIGH);
+    digitalWrite(MOTOR_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, HIGH);
+  }
+
+  analogWrite(MOTOR_EN, pwm);
+}
+
+void stopMotor() {
+  analogWrite(MOTOR_EN, 0);
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+}
+
+// ENCODER ZEROING (average several reads)
+// Averages offsets from the first good read rather than raw
+// counts: raw counts straddling the 16383 -> 0 wrap (e.g. an
+// encoder whose zero was set at this position) would average
+// to somewhere far round the circle instead.
+uint16_t averagePosition(uint8_t cs) {
+  uint16_t first = 0xFFFF;
+  int32_t sum = 0;
+  uint8_t n = 0;
+
+  for (uint8_t i = 0; i < 16; i++) {
+    uint16_t p = getPositionWithRetry(cs, RES14);
+    if (p != 0xFFFF) {
+      if (first == 0xFFFF)
+        first = p;
+      int16_t rel = (int16_t)((p - first) & 0x3FFF);
+      if (rel > 8191)
+        rel -= 16384;
+      sum += rel;
+      n++;
+    }
+    delay(5);
+  }
+
+  if (n == 0)
+    return 0;
+  return (uint16_t)(first + sum / n) & 0x3FFF;
+}
+
+// ENCODER READ WITH RETRY (same as Exp 2)
+uint16_t getPositionWithRetry(uint8_t encoder, uint8_t resolution) {
+  uint16_t position = getPositionSPI(encoder, resolution);
+
+  if (position != 0xFFFF)
+    return position;
+
+  delayMicroseconds(10);
+
+  return getPositionSPI(encoder, resolution);
+}
+
+// AMT22 POSITION READ (same as Exp 2)
+uint16_t getPositionSPI(uint8_t encoder, uint8_t resolution) {
+  uint16_t currentPosition;
+  bool binaryArray[16];
+
+  digitalWrite(encoder, LOW);
   delayMicroseconds(3);
 
-  //OR the low byte with the currentPosition variable. release line after second byte
-  currentPosition |= spiWriteRead(AMT22_NOP, encoder, true);        
+  currentPosition = ((uint16_t)SPI.transfer(AMT22_NOP)) << 8;
+  delayMicroseconds(3);
+  currentPosition |= SPI.transfer(AMT22_NOP);
 
-  //run through the 16 bits of position and put each bit into a slot in the array so we can do the checksum calculation
-  for(int i = 0; i < 16; i++) binaryArray[i] = (0x01) & (currentPosition >> (i));
+  delayMicroseconds(3);
+  digitalWrite(encoder, HIGH);
 
-  //using the equation on the datasheet we can calculate the checksums and then make sure they match what the encoder sent
-  if ((binaryArray[15] == !(binaryArray[13] ^ binaryArray[11] ^ binaryArray[9] ^ binaryArray[7] ^ binaryArray[5] ^ binaryArray[3] ^ binaryArray[1]))
-          && (binaryArray[14] == !(binaryArray[12] ^ binaryArray[10] ^ binaryArray[8] ^ binaryArray[6] ^ binaryArray[4] ^ binaryArray[2] ^ binaryArray[0])))
-    {
-      //we got back a good position, so just mask away the checkbits
-      currentPosition &= 0x3FFF;
-    }
-  else
-  {
-    currentPosition = 0xFFFF; //bad position
+  for (int i = 0; i < 16; i++) {
+    binaryArray[i] = (currentPosition >> i) & 0x01;
   }
 
-  //If the resolution is 12-bits, and wasn't 0xFFFF, then shift position, otherwise do nothing
-  if ((resolution == RES12) && (currentPosition != 0xFFFF)) currentPosition = currentPosition >> 2;
+  // AMT22 checksum
+  if ((binaryArray[15] ==
+       !(binaryArray[13] ^ binaryArray[11] ^ binaryArray[9] ^ binaryArray[7] ^
+         binaryArray[5] ^ binaryArray[3] ^ binaryArray[1])) &&
+      (binaryArray[14] ==
+       !(binaryArray[12] ^ binaryArray[10] ^ binaryArray[8] ^ binaryArray[6] ^
+         binaryArray[4] ^ binaryArray[2] ^ binaryArray[0]))) {
+    currentPosition &= 0x3FFF;
+  } else {
+    return 0xFFFF;
+  }
+
+  if (resolution == RES12)
+    currentPosition = currentPosition >> 2;
 
   return currentPosition;
-}
-
-/*
- * This function does the SPI transfer. sendByte is the byte to transmit. 
- * Use releaseLine to let the spiWriteRead function know if it should release
- * the chip select line after transfer.  
- * This function takes the pin number of the desired device as an input
- * The received data is returned.
- */
-uint8_t spiWriteRead(uint8_t sendByte, uint8_t encoder, uint8_t releaseLine)
-{
-  //holder for the received over SPI
-  uint8_t data;
-
-  //set cs low, cs may already be low but there's no issue calling it again except for extra time
-  setCSLine(encoder ,LOW);
-
-  //There is a minimum time requirement after CS goes low before data can be clocked out of the encoder.
-  //We will implement that time delay here, however the arduino is not the fastest device so the delay
-  //is likely inherantly there already
-  delayMicroseconds(3);
-
-  //send the command  
-  data = SPI.transfer(sendByte);
-  delayMicroseconds(3); //There is also a minimum time after clocking that CS should remain asserted before we release it
-  setCSLine(encoder, releaseLine); //if releaseLine is high set it high else it stays low
-  
-  return data;
-}
-
-/*
- * This function sets the state of the SPI line. It isn't necessary but makes the code more readable than having digitalWrite everywhere 
- * This function takes the pin number of the desired device as an input
- */
-void setCSLine (uint8_t encoder, uint8_t csLine)
-{
-  digitalWrite(encoder, csLine);
-}
-
-/*
- * The AMT22 bus allows for extended commands. The first byte is 0x00 like a normal position transfer, but the 
- * second byte is the command.  
- * This function takes the pin number of the desired device as an input
- */
-void setZeroSPI(uint8_t encoder)
-{
-  spiWriteRead(AMT22_NOP, encoder, false);
-
-  //this is the time required between bytes as specified in the datasheet.
-  //We will implement that time delay here, however the arduino is not the fastest device so the delay
-  //is likely inherantly there already
-  delayMicroseconds(3); 
-  
-  spiWriteRead(AMT22_ZERO, encoder, true);
-  delay(250); //250 second delay to allow the encoder to reset
-}
-
-/*
- * The AMT22 bus allows for extended commands. The first byte is 0x00 like a normal position transfer, but the 
- * second byte is the command.  
- * This function takes the pin number of the desired device as an input
- */
-void resetAMT22(uint8_t encoder)
-{
-  spiWriteRead(AMT22_NOP, encoder, false);
-
-  //this is the time required between bytes as specified in the datasheet.
-  //We will implement that time delay here, however the arduino is not the fastest device so the delay
-  //is likely inherantly there already
-  delayMicroseconds(3); 
-  
-  spiWriteRead(AMT22_RESET, encoder, true);
-  
-  delay(250); //250 second delay to allow the encoder to start back up
 }
