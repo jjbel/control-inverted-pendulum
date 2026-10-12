@@ -198,23 +198,30 @@ def send_gains(ser, k, ready):
 
 def read_serial(ser, stop, log, ready):
     """Echo every line to the terminal, and to the log file if there is one."""
+    # Lines are split here rather than with ser.readline(): on this laptop
+    # (x64 Python emulated on ARM64 Windows) pyserial's readline() returns the
+    # same stale fragment thousands of times a second, while read() is fine.
+    pending = b""
     while not stop.is_set():
         try:
-            raw = ser.readline()
+            chunk = ser.read(ser.in_waiting or 1)
         except serial.SerialException as exc:
             print(f"serial error: {exc}", file=sys.stderr)
             break
 
-        if not raw:
+        if not chunk:
             continue
 
-        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-        print(line, flush=True)
-        if line.startswith(GAINS_LINE):
-            ready.set()
-        if log:
-            log.write(line + "\n")
-            log.flush()
+        pending += chunk
+        *complete, pending = pending.split(b"\n")
+        for raw in complete:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r")
+            print(line, flush=True)
+            if line.startswith(GAINS_LINE):
+                ready.set()
+            if log:
+                log.write(line + "\n")
+                log.flush()
 
     stop.set()
 

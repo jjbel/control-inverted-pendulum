@@ -78,6 +78,7 @@
 #define ALPHA_LIMIT_DEG 30.0  // disengage above this
 #define THETA_LIMIT_DEG 120.0 // arm safety limit
 #define VEL_FILTER_ALPHA 0.35 // velocity LPF, 0..1
+#define BAD_READ_LIMIT 10     // failed reads in a row (50 ms) before the motor is cut
 
 // L298N + motor deadband: smallest voltage that actually
 // makes the motor move. Commands are boosted past this so
@@ -111,6 +112,7 @@ float K[4] = {K1, K2, K3, K4};
 
 unsigned long lastLoopMicros = 0;
 int print_variable = 0;
+uint16_t badReads = 0; // consecutive failed encoder reads
 
 // SETUP
 void setup() {
@@ -136,7 +138,6 @@ void setup() {
   stopMotor();
 
   printf("\n====================================\n"
-         "*** VEDIKA'S CODE ***\n"
          "INVERTED PENDULUM - LQR BALANCE\n\n");
   printGains();
   printf("\nLet pendulum HANG DOWN at rest, arm\n"
@@ -176,10 +177,25 @@ void loop() {
   uint16_t pendEncoder = getPositionWithRetry(PEND_CS, RES14);
 
   if (armEncoder == 0xFFFF || pendEncoder == 0xFFFF) {
-    // Bad SPI read: skip this tick (state held; safety
-    // limits still protect us on the next good read)
+    // Bad SPI read: skip this tick, holding the last command.
+    // The safety limits can't act without readings, so after
+    // BAD_READ_LIMIT in a row cut the motor and disengage, and
+    // say which encoder is silent at the telemetry rate.
+    badReads++;
+    if (badReads >= BAD_READ_LIMIT) {
+      if (controlActive) {
+        controlActive = false;
+        printf(">>> DISENGAGED (encoder not responding) <<<\n");
+      }
+      stopMotor();
+    }
+    if (badReads % 20 == 0)
+      printf("encoder read failed: arm (CS %d) %s, pend (CS %d) %s\n",
+             ARM_CS, armEncoder == 0xFFFF ? "FAIL" : "ok", PEND_CS,
+             pendEncoder == 0xFFFF ? "FAIL" : "ok");
     return;
   }
+  badReads = 0;
 
   // COUNTS -> ANGLES (rad)
   // theta: arm angle from its zero, wrapped to +/-pi
