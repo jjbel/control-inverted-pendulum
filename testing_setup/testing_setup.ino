@@ -55,8 +55,8 @@
 // rewiring anything.
 #define MOTOR_SIGN -1
 #define ALPHA_SIGN 1
-#define THETA_SIGN -1 // flipped after the rig swap: arm ran away at the
-                      // rate the model predicts for a backwards theta
+// THETA_SIGN -1 was tried after the rig swap and balanced worse than 1
+#define THETA_SIGN 1
 
 // LQR GAINS  (units: V/rad and V/(rad/s))
 //
@@ -79,7 +79,8 @@
 #define ALPHA_LIMIT_DEG 30.0  // disengage above this
 #define THETA_LIMIT_DEG 120.0 // arm safety limit
 #define VEL_FILTER_ALPHA 0.35 // velocity LPF, 0..1
-#define BAD_READ_LIMIT 10     // failed reads in a row (50 ms) before the motor is cut
+#define BAD_READ_LIMIT                                                         \
+  10 // failed reads in a row (50 ms) before the motor is cut
 
 // L298N + motor deadband: smallest voltage that actually
 // makes the motor move. Commands are boosted past this so
@@ -191,8 +192,8 @@ void loop() {
       stopMotor();
     }
     if (badReads % 20 == 0)
-      printf("encoder read failed: arm (CS %d) %s, pend (CS %d) %s\n",
-             ARM_CS, armEncoder == 0xFFFF ? "FAIL" : "ok", PEND_CS,
+      printf("encoder read failed: arm (CS %d) %s, pend (CS %d) %s\n", ARM_CS,
+             armEncoder == 0xFFFF ? "FAIL" : "ok", PEND_CS,
              pendEncoder == 0xFFFF ? "FAIL" : "ok");
     return;
   }
@@ -249,7 +250,8 @@ void loop() {
 
   // LQR CONTROL LAW:  u = -K x   (u in Volts)
   if (controlActive) {
-    float u = -(K[0] * theta + K[1] * alpha + K[2] * thetaDot + K[3] * alphaDot);
+    float u =
+        -(K[0] * theta + K[1] * alpha + K[2] * thetaDot + K[3] * alphaDot);
 
     if (u > VMAX)
       u = VMAX;
