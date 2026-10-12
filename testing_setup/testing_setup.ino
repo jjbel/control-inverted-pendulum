@@ -55,7 +55,8 @@
 // rewiring anything.
 #define MOTOR_SIGN -1
 #define ALPHA_SIGN 1
-#define THETA_SIGN 1
+#define THETA_SIGN -1 // flipped after the rig swap: arm ran away at the
+                      // rate the model predicts for a backwards theta
 
 // LQR GAINS  (units: V/rad and V/(rad/s))
 //

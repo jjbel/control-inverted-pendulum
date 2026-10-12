@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import serial
@@ -56,6 +57,13 @@ GAINS_BLOCK_RE = re.compile(
 
 # the line the sketch prints its gains on, at startup and after a "k" command
 GAINS_LINE = "K = ["
+
+# Output is shown from the sketch's startup banner on. Until the board's first
+# real bytes arrive (~0.9 s after the open resets it), reads on this laptop can
+# return hundreds of KB of repeated stale fragments. If no banner turns up in
+# BANNER_WAIT_S the board didn't reset, so output starts at the next full line.
+BANNER = b"INVERTED PENDULUM"
+BANNER_WAIT_S = 3.0
 
 # log4j lines the IDE prints on the way up; ~420 of them per invocation
 NOISE_RE = re.compile(r"^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+StatusLogger\b")
@@ -122,6 +130,17 @@ def upload_sketch(port, fqbn, sketch):
         )
 
     print(f"building {sketch.name} and uploading to {port}", flush=True)
+
+    # A fresh open of the port can return stale junk (see BANNER), which looks
+    # to avrdude like a bootloader that never answers; uploads that timed out
+    # three times in a row went through after one open-and-drain first.
+    try:
+        with serial.Serial(port, 115200, timeout=0.1) as ser:
+            drain_until = time.monotonic() + 1.5
+            while time.monotonic() < drain_until:
+                ser.read(ser.in_waiting or 1)
+    except serial.SerialException as exc:
+        sys.exit(f"could not open {port}: {exc}")
 
     for command in commands:
         result = subprocess.run(command, capture_output=True, text=True, errors="replace")
@@ -202,6 +221,8 @@ def read_serial(ser, stop, log, ready):
     # (x64 Python emulated on ARM64 Windows) pyserial's readline() returns the
     # same stale fragment thousands of times a second, while read() is fine.
     pending = b""
+    synced = False
+    opened = time.monotonic()
     while not stop.is_set():
         try:
             chunk = ser.read(ser.in_waiting or 1)
@@ -213,6 +234,19 @@ def read_serial(ser, stop, log, ready):
             continue
 
         pending += chunk
+        if not synced:
+            start = pending.find(BANNER)
+            if start >= 0:
+                pending = pending[start:]
+                synced = True
+            elif time.monotonic() - opened > BANNER_WAIT_S:
+                pending = pending[pending.rfind(b"\n") + 1 :]
+                synced = True
+            else:
+                # keep just enough to catch a banner split across reads
+                pending = pending[-len(BANNER) :]
+                continue
+
         *complete, pending = pending.split(b"\n")
         for raw in complete:
             line = raw.decode("utf-8", errors="replace").rstrip("\r")
